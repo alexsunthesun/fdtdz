@@ -33,6 +33,8 @@ def _preset_launch_params(device_kind):
     return ((2, 4), (10, 8), 2, (7, 0))
   elif "A100" in device_kind:
     return ((2, 4), (12, 9), 4, (8, 0))
+  elif "H100" in device_kind:
+    return ((2, 4), (12, 11), 4, (8, 0))
   else:
     raise ValueError(
         f"No preset launch parameters available for \"{device_kind}\".")
