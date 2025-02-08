@@ -1,6 +1,6 @@
 # `mkdir build && cd build && cmake .. && make -j && ctest --verbose`.
 
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.16)
 
 project(fdtdz LANGUAGES CXX CUDA)
 
@@ -87,22 +87,16 @@ endmacro()
   
 # Generate ptx code for the following "GPUs: compute_capability".
 #
-# K80: 3.7
-# P100: 6.0 (P4: 6.1)
-# V100: 7.0
 # T4: 7.5 
 # A100: 8.0
 #
 
-kern32gen_npml(37)
-kern32gen_npml(60)
-kern32gen_npml(70)
 kern32gen_npml(75)
 kern32gen_npml(80)
-kern16gen_npml(60)
-kern16gen_npml(70)
+kern32gen_npml(90)
 kern16gen_npml(75)
 kern16gen_npml(80)
+kern16gen_npml(90)
 kerngen_bmark(75 7)
 
 
