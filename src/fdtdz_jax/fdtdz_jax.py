@@ -7,17 +7,12 @@ import sys
 
 import numpy as np
 import jax
-from jax import core, dtypes, lax
 from jax import numpy as jnp
-from jax.core import ShapedArray
-from jax.interpreters import ad, batching, mlir, xla
-from jax.lib import xla_client
-from jaxlib.hlo_helpers import custom_call
 
-# If the GPU version exists, also register those
+# Register the GPU kernels as (legacy, opaque-descriptor) XLA custom calls.
 from . import gpu_ops
 for _name, _value in gpu_ops.registrations().items():
-  xla_client.register_custom_call_target(_name, _value, platform="gpu")
+  jax.ffi.register_ffi_target(_name, _value, platform="CUDA", api_version=0)
 
 # Number of cells to use for padding the systolic update scheme.
 _NUM_PAD_CELLS = 4
@@ -35,6 +30,11 @@ def _preset_launch_params(device_kind):
     return ((2, 4), (12, 9), 4, (8, 0))
   elif "H100" in device_kind:
     return ((2, 4), (12, 11), 4, (8, 0))
+  elif "RTX 5070 Ti" in device_kind:
+    # 70 SMs. The compute_80 PTX (JIT-compiled by the driver) is ~1.5x faster
+    # than native compute_120 PTX in reduced precision; compute_120 is ~5%
+    # faster in full precision. See ``bench/bench_fdtdz.py``.
+    return ((2, 4), (10, 7), 4, (8, 0))
   else:
     raise ValueError(
         f"No preset launch parameters available for \"{device_kind}\".")
@@ -400,10 +400,12 @@ def fdtdz(
         "be \"v-dominant\" in that ``blocku * gridu <= blockv * gridv`` must be "
         "satisfied.")
 
-  if compute_capability not in ((3, 7), (6, 0), (7, 0), (7, 5), (8, 0)):
+  if compute_capability not in ((3, 7), (6, 0), (7, 0), (7, 5), (8, 0),
+                                (9, 0), (12, 0)):
     raise ValueError(
         f"Unrecognized compute capability {compute_capability}. "
-        "Must be one of (3, 7), (6, 0), (7, 0), (7, 5), or (8, 0).")
+        "Must be one of (3, 7), (6, 0), (7, 0), (7, 5), (8, 0), (9, 0), or "
+        "(12, 0).")
 
   # Once again, for performance reasons, we require that there be 4 cells of
   # padding in the x- and y-directions, and that the actual simulated areas
@@ -515,7 +517,7 @@ def fdtdz(
 
 def fdtdz_impl(cbuffer, abslayer, srclayer, waveform, zcoeff, **kwargs):
   """Low-level API to the simulation kernel."""
-  buffer_, cbuffer_, mask_, src_, output_ = _fdtdz_prim.bind(
+  buffer_, cbuffer_, mask_, src_, output_ = _fdtdz_call(
       cbuffer, abslayer, srclayer, waveform, zcoeff, **kwargs)
   # Only return ``output_``, since all other "*_" are temporary arrays needed
   # inside the simulation kernel only.
@@ -534,7 +536,10 @@ def _internal_shapes(**kwargs):
       "buffer": (6, xx, yy, 64),  # Larger than needed.
       "cbuffer": (3, xx, yy, 64),  # Larger than needed.
       "mask": (xx, yy // 2, 32),
-      "src": (xx, yy // 2, 32) if kwargs["srctype"] == 1 else (2, xx, zz),
+      # The y-slice source needs ``2 * Nz * 32 = 128`` values per x-position
+      # (``slice::YSrc::ChunkSize``), independent of ``zz``. Sizing it by
+      # ``zz`` under-allocates in full precision (``zz = 64 - pml``).
+      "src": (xx, yy // 2, 32) if kwargs["srctype"] == 1 else (2, xx, 64),
       "output": (kwargs["outnum"],
                  3,
                  kwargs["subvolume_size"][0] + 2 * _NUM_PAD_CELLS,
@@ -543,25 +548,8 @@ def _internal_shapes(**kwargs):
   }
 
 
-def _fdtdz_abstract(cbuffer, abslayer, srclayer, waveform, zcoeff, **kwargs):
-  # Assume ``cbuffer`` to be of shape ``(3, xx, yy, zz)``.
-  # (_, xx, yy, zz) = cbuffer.shape
-  shapes = _internal_shapes(**kwargs)
-  return (
-      ShapedArray(shapes["buffer"], dtype=jnp.float32),  # buffer.
-      ShapedArray(shapes["cbuffer"], dtype=jnp.float32),  # cbuffer.
-      ShapedArray(shapes["mask"], dtype=jnp.float32),  # mask.
-      ShapedArray(shapes["src"], dtype=jnp.float32),  # src.
-      ShapedArray(shapes["output"], dtype=jnp.float32),  # output.
-  )
-
-
-def _default_layouts(*shapes):
-  return [range(len(shape) - 1, -1, -1) for shape in shapes]
-
-
-def _fdtdz_lowering(ctx, cbuffer, abslayer, srclayer, waveform, zcoeff,
-                    **kwargs):
+def _fdtdz_call(cbuffer, abslayer, srclayer, waveform, zcoeff, **kwargs):
+  """Invokes the kernel as a legacy XLA custom call via ``jax.ffi``."""
   opaque = gpu_ops.build_kernel_descriptor(
       kwargs["dt"],
       kwargs["capability"],
@@ -594,42 +582,26 @@ def _fdtdz_lowering(ctx, cbuffer, abslayer, srclayer, waveform, zcoeff,
       kwargs["dirname"],
   )
 
-  (_, xx, yy, zz) = mlir.ir.RankedTensorType(cbuffer.type).shape
   shapes = _internal_shapes(**kwargs)
+  result_shape_dtypes = [
+      jax.ShapeDtypeStruct(shapes[name], jnp.float32)
+      for name in ("buffer", "cbuffer", "mask", "src", "output")
+  ]
 
-  out = custom_call(
+  # Layouts are given in major-to-minor order (the reverse of XLA's
+  # minor-to-major convention). Results use the default row-major layout.
+  input_layouts = [
+      (0, 1, 2, 3),  # cbuffer.
+      (0, 2, 1),  # abslayer.
+      (1, 0, 2) if kwargs["srctype"] == 0 else (0, 3, 2, 1),  # srclayer.
+      (0, 1),  # waveform.
+      (0, 1),  # zcoeff.
+  ]
+
+  return jax.ffi.ffi_call(
       "kernel_f16" if kwargs["use_reduced_precision"] else "kernel_f32",
-      result_types=[
-          mlir.ir.RankedTensorType.get(shapes["buffer"],
-                                       mlir.ir.F32Type.get()),
-          mlir.ir.RankedTensorType.get(shapes["cbuffer"],
-                                       mlir.ir.F32Type.get()),
-          mlir.ir.RankedTensorType.get(shapes["mask"], mlir.ir.F32Type.get()),
-          mlir.ir.RankedTensorType.get(shapes["src"], mlir.ir.F32Type.get()),
-          mlir.ir.RankedTensorType.get(shapes["output"],
-                                       mlir.ir.F32Type.get()),
-      ],
-      operands=[cbuffer, abslayer, srclayer, waveform, zcoeff],
-      operand_layouts=[
-          (3, 2, 1, 0),  # cbuffer.
-          (1, 2, 0),  # abslayer.
-          (2, 0, 1) if kwargs["srctype"] == 0 else (1, 2, 3, 0),  # srclayer.
-          (1, 0),  # waveform.
-          (1, 0),  # zcoeff.
-      ],
-      result_layouts=_default_layouts(shapes["buffer"], shapes["cbuffer"],
-                                      shapes["mask"], shapes["src"],
-                                      shapes["output"]),
-      backend_config=opaque).results
-
-  return out
-
-
-# Register op with JAX.
-_fdtdz_prim = core.Primitive("fdtdz")
-_fdtdz_prim.multiple_results = True
-_fdtdz_prim.def_impl(functools.partial(xla.apply_primitive, _fdtdz_prim))
-_fdtdz_prim.def_abstract_eval(_fdtdz_abstract)
-
-# Connect the XLA translation rules for JIT compilation
-mlir.register_lowering(_fdtdz_prim, _fdtdz_lowering, platform="gpu")
+      result_shape_dtypes,
+      input_layouts=input_layouts,
+      custom_call_api_version=2,
+      legacy_backend_config=opaque,
+  )(cbuffer, abslayer, srclayer, waveform, zcoeff)

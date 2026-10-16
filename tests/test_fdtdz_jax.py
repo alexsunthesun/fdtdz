@@ -7,7 +7,6 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".99"
 
 import fdtdz_jax
 from jax.test_util import check_grads
-from jax.config import config
 import jax.numpy as jnp
 import jax
 import pytest
@@ -182,6 +181,41 @@ def test_point_source(xx, yy, tt, dt, src_type, src_wavelength,
   sub_fields, err = mysim(use_subvolume=True)
   np.testing.assert_array_equal(
       full_fields[..., 120:125, 130:140, 30:33], sub_fields)
+
+
+@pytest.mark.parametrize("src_type", ["x", "y", "z"])
+@pytest.mark.parametrize("pml_widths", [(4, 4), (10, 10)])
+def test_full_precision_pml(src_type, pml_widths, xx=200, yy=200, tt=20000,
+                            dt=0.5, src_wavelength=10.0, max_err=2e-2):
+  """Full precision with z-PML is accurate and deterministic.
+
+  Regression test for the y-slice source buffer being under-allocated when
+  ``zz = 64 - pml`` (full precision), which corrupted neighboring buffers.
+  """
+  quarter_period = int(round(src_wavelength / 4 / dt))
+  zz = 64 - sum(pml_widths)
+
+  def mysim():
+    return _simulate(
+        epsilon=np.ones((3, xx, yy, zz), np.float32),
+        dt=dt,
+        tt=tt,
+        src_type=src_type,
+        src_wavelength=src_wavelength,
+        src_ramp=12,
+        abs_width=40,
+        abs_smoothness=1e-3,
+        pml_widths=pml_widths,
+        output_steps=(tt - quarter_period - 1, tt, quarter_period),
+        use_reduced_precision=False,
+        subvolume_offset=(0, 0, 0),
+        subvolume_size=None,
+    )
+
+  fields, err = mysim()
+  assert not np.any(np.isnan(fields))
+  assert np.max(np.abs(err)) < max_err
+  np.testing.assert_array_equal(fields, mysim()[0])
 
 
 @pytest.mark.parametrize(

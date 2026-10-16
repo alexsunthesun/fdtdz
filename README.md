@@ -25,6 +25,29 @@ Once this is done, you can just do `pip install fdtdz` or `!pip install fdtdz` d
 
 To install from source, please see this [very helpful write-up](https://github.com/spinsphotonics/fdtdz/issues/14#issue-1794133653) by [@johnrollinson](https://github.com/johnrollinson).
 
+#### From source with modern JAX (tested on RTX 5070 Ti, Ubuntu 26.04)
+
+Requires an NVIDIA driver whose CUDA version (`nvidia-smi`) is at least that of the toolkit used to generate the PTX (here driver 615 / CUDA 13.4).
+
+```bash
+uv venv .venv --python 3.13
+VIRTUAL_ENV=.venv uv pip install "jax[cuda13]==0.11.2" pytest pybind11 cmake setuptools setuptools_scm wheel
+PATH=/usr/local/cuda-13.4/bin:$PWD/.venv/bin:$PATH CUDACXX=/usr/local/cuda-13.4/bin/nvcc \
+  VIRTUAL_ENV=.venv uv pip install -e . --no-build-isolation
+.venv/bin/python -m pytest tests/                # Python tests.
+.venv/bin/python bench/bench_fdtdz.py --sweep    # Launch-parameter benchmark.
+```
+
+CUDA unit tests: `cd cuda && cmake -B build && cmake --build build -j && ctest --test-dir build`.
+New PTX kernels are written to `cuda/ptx/` and must be copied to `src/fdtdz_jax/ptx/`.
+
+RTX 5070 Ti throughput with the preset `((2, 4), (10, 7), 4, (8, 0))`, in billions of cell-updates per second (full domain including z-PML, 2000 steps):
+
+| precision | 400×400 | 800×800 | 1200×1200 |
+|---|---|---|---|
+| reduced (f16) | 86 | 72 | 60 |
+| full (f32) | 28 | 23 | 20 |
+
 ## Frequently Asked Questions
 
 ### Is the plan to build additional functionality inside the *fdtd-z* repo?

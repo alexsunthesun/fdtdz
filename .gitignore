@@ -10,3 +10,6 @@ src/fdtdz_jax/fdtdz_jax_version.py
 # artifacts of install
 dist/
 dist/**
+.venv/
+cuda/ptx/
+src/fdtdz_jax/*.so

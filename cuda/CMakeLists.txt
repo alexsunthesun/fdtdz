@@ -9,7 +9,7 @@ find_package(CUDAToolkit REQUIRED)
 
 enable_language(CUDA)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 75)  # Target RTX4000 and T4.
+set(CMAKE_CUDA_ARCHITECTURES 120)  # Target RTX 5070 Ti.
 
 # Download googletest and google benchmark from github.
 include(FetchContent)
@@ -89,14 +89,18 @@ endmacro()
 #
 # T4: 7.5 
 # A100: 8.0
+# H100: 9.0
+# RTX 5070 Ti: 12.0
 #
 
 kern32gen_npml(75)
 kern32gen_npml(80)
 kern32gen_npml(90)
+kern32gen_npml(120)
 kern16gen_npml(75)
 kern16gen_npml(80)
 kern16gen_npml(90)
+kern16gen_npml(120)
 kerngen_bmark(75 7)
 
 
